@@ -22,6 +22,9 @@
 #include <time.h>
 #include <cerrno>
 
+#include <sched.h>
+#include <pthread.h>
+
 static std::mutex can_mutex;
 
 constexpr const char* CAN_INTERFACE          = "can1";
@@ -29,9 +32,9 @@ constexpr const char* CSV_LOG_FILENAME       = "schema.csv";
 constexpr int CYCLE_FREQUENCY_HZ             = 500;
 constexpr int CYCLE_PERIOD_MS                = (1000 / CYCLE_FREQUENCY_HZ);
 constexpr int SYNC_PROCESSING_DELAY_US       = 800; 
-constexpr int MASTER_HEARTBEAT_INTERVAL_MS   = 500;
-constexpr int NODE_HEARTBEAT_INTERVAL_MS     = 500;  
-constexpr int HEARTBEAT_TIMEOUT_MS           = 1500; 
+constexpr int MASTER_HEARTBEAT_INTERVAL_MS   = 100;
+// constexpr int NODE_HEARTBEAT_INTERVAL_MS     = 500;  
+constexpr int HEARTBEAT_TIMEOUT_MS           = 200; 
 constexpr int TPDO1_SYNC_INTERVAL            = 1; 
 constexpr int TPDO2_SYNC_INTERVAL            = 20;
 
@@ -94,9 +97,12 @@ struct NodeControl {
     bool waiting_for_response;
     bool heartbeat_timeout;
 
+    /*Recovery state machine variables*/ 
     bool is_recovering;
     int recovery_step;
     int recovery_timer; 
+    int toggle_cooldown = 0;
+
 
     NodeControl(uint8_t node_id, MotorType type) 
         : id(node_id), 
@@ -153,7 +159,7 @@ static int can_socket = -1;
 static std::vector<NodeControl> nodes;
 static uint32_t sync_counter = 0;
 
-/* Lock-Free Ring Buffer Definition*/
+/*Lock-Free Ring Buffer Definition*/ 
 template <typename T, size_t Size>
 class LockFreeRingBuffer {
 private:
@@ -197,10 +203,36 @@ static std::thread logger_thread;
 static std::thread heartbeat_thread;
 static std::chrono::steady_clock::time_point global_start_time;
 
-/* Utils*/
+/*Utils*/
 void signal_handler(int) { running = false; }
 inline void delay_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 inline void delay_us(int us) { std::this_thread::sleep_for(std::chrono::microseconds(us)); }
+
+void pinThisThreadToCore(int core_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+
+    pthread_t current_thread = pthread_self();
+    
+    int rc = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        std::cerr << "[SYSTEM] Failed to pin to Core " << core_id << "\n";
+    } else {
+        std::cout << "[SYSTEM] Thread pinned to Core " << core_id << "\n";
+    }
+
+    struct sched_param param;
+    param.sched_priority = 90; 
+    rc = pthread_setschedparam(current_thread, SCHED_FIFO, &param);
+    
+    if (rc != 0) {
+        std::cerr << "[SYSTEM] Failed to set SCHED_FIFO: " << strerror(errno) 
+                  << " (Run with sudo!)\n";
+    } else {
+        std::cout << "[SYSTEM] Real-time priority (SCHED_FIFO, 90) active.\n";
+    }
+}
 
 void loggerThreadFunc() {
     std::ofstream log_file(CSV_LOG_FILENAME);
@@ -293,7 +325,6 @@ void sendFrame(uint32_t id, uint8_t len, const uint8_t* d = nullptr) {
     f.can_dlc = len;
     if (d) memcpy(f.data, d, len);
 
-    // 1. Thread Safety: Lock mutex
     std::lock_guard<std::mutex> lock(can_mutex);
 
     int retries = 0;
@@ -303,7 +334,7 @@ void sendFrame(uint32_t id, uint8_t len, const uint8_t* d = nullptr) {
         if (nbytes == sizeof(f)) {
             break; 
         }
-        /* Retry*/
+
         if (nbytes < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
                 if (++retries > 50) {
@@ -362,9 +393,7 @@ void sendSDO(uint8_t id, uint8_t cs, uint16_t idx, uint8_t sub, int32_t val) {
 
 void sendRPDO_Velocity(uint8_t id, int32_t vel) {
     uint8_t d[4]; 
-    
     memcpy(d, &vel, 4);
-    
     sendFrame(0x200 + id, 4, d);
     
     for (auto& node : nodes) {
@@ -434,15 +463,15 @@ void initSingleNode(NodeControl& node) {
     sendNMT(0x80, node.id); delay_ms(150); 
     uint32_t master_hb_config = (static_cast<uint32_t>(HEARTBEAT_TIMEOUT_MS) << 16) | 0x00;
     sendSDO(node.id, 0x23, 0x1016, 0x01, master_hb_config); delay_ms(20);
-    sendSDO(node.id, 0x2F, 0x6060, 0x00, 0x03); delay_ms(20);
+    sendSDO(node.id, 0x2F, 0x6060, 0x00, 0xFD); delay_ms(20);
 
-    /* MAPPING RPDO1: Velocity Only */
-    sendSDO(node.id, 0x23, 0x1400, 0x01, 0x80000200 + node.id); delay_ms(20); 
-    sendSDO(node.id, 0x2F, 0x1600, 0x00, 0x00); delay_ms(20); 
-    sendSDO(node.id, 0x23, 0x1600, 0x01, 0x60FF0020); delay_ms(20); 
-    sendSDO(node.id, 0x2F, 0x1600, 0x00, 0x01); delay_ms(20); 
-    sendSDO(node.id, 0x2F, 0x1400, 0x02, 0x01); delay_ms(20); 
-    sendSDO(node.id, 0x23, 0x1400, 0x01, 0x0200 + node.id); delay_ms(20); 
+    /*MAPPING RPDO1: Velocity Only (0x60FF sub 0)*/
+    sendSDO(node.id, 0x23, 0x1400, 0x01, 0x80000200 + node.id); delay_ms(20);
+    sendSDO(node.id, 0x2F, 0x1600, 0x00, 0x00); delay_ms(20);
+    sendSDO(node.id, 0x23, 0x1600, 0x01, 0x60FF0020); delay_ms(20);
+    sendSDO(node.id, 0x2F, 0x1600, 0x00, 0x01); delay_ms(20);
+    sendSDO(node.id, 0x2F, 0x1400, 0x02, 0x01); delay_ms(20);
+    sendSDO(node.id, 0x23, 0x1400, 0x01, 0x0200 + node.id); delay_ms(20);
 
     /* MAPPING TPDO1: Velocity Feedback*/
     sendSDO(node.id, 0x23, 0x1800, 0x01, 0x80000180 + node.id); delay_ms(20);
@@ -452,7 +481,7 @@ void initSingleNode(NodeControl& node) {
     sendSDO(node.id, 0x2F, 0x1800, 0x02, TPDO1_SYNC_INTERVAL); delay_ms(20);
     sendSDO(node.id, 0x23, 0x1800, 0x01, 0x0180 + node.id); delay_ms(20);
 
-    /*MAPPING TPDO2: Statusword (Heartbeat)*/
+    // MAPPING TPDO2: Statusword (Heartbeat)
     sendSDO(node.id, 0x23, 0x1801, 0x01, 0x80000280 + node.id); delay_ms(20);
     sendSDO(node.id, 0x2F, 0x1A01, 0x00, 0x00); delay_ms(20);
     sendSDO(node.id, 0x23, 0x1A01, 0x01, 0x60410010); delay_ms(20);
@@ -511,7 +540,6 @@ int main(int argc, char* argv[]) {
     
     logger_running = true;
     logger_thread = std::thread(loggerThreadFunc);
-    
     std::cout << "[LOGGING] CSV logging started - writing to " << CSV_LOG_FILENAME << "\n";
 
     can_socket = setupCAN(argc > 1 ? argv[1] : CAN_INTERFACE);
@@ -523,12 +551,12 @@ int main(int argc, char* argv[]) {
     heartbeat_thread = std::thread(masterHeartbeatLoop);
 
     initAllNodes();
+    pinThisThreadToCore(8); 
 
     auto next = std::chrono::steady_clock::now();
     const auto period = std::chrono::milliseconds(CYCLE_PERIOD_MS);
 
-    std::cout << "[LOOP] Starting Loop. TPDO2 configured as time-based heartbeat every " 
-              << NODE_HEARTBEAT_INTERVAL_MS << "ms.\n";
+    std::cout << "[LOOP] Starting Loop on Core 8...\n";
 
     int loop_counter = 0;
 
@@ -544,8 +572,8 @@ int main(int argc, char* argv[]) {
         for (auto& node : nodes) {
             if (node.fault_active || (node.tpdo2_received && (node.statusword & SW_FAULT))) {
                 if (!node.fault_active) {
-                      addLog("ERROR", node.id, 0, "ERR", nullptr, 0, "Node Fault Detected");
-                      node.fault_active = true;
+                       addLog("ERROR", node.id, 0, "ERR", nullptr, 0, "Node Fault Detected");
+                       node.fault_active = true;
                 }
                 if (!node.is_recovering) {
                     node.is_recovering = true;
@@ -558,15 +586,14 @@ int main(int argc, char* argv[]) {
                     !(node.last_statusword & SW_TARGET_REACHED)) {
                 
                 node.current_target_velocity = (node.current_target_velocity == node.velocity_forward) 
-                                                                             ? node.velocity_reverse 
-                                                                             : node.velocity_forward;
+                                                                              ? node.velocity_reverse 
+                                                                              : node.velocity_forward;
             }
             if (node.tpdo2_received) node.last_statusword = node.statusword;
         }
 
         checkNodeHeartbeats();
 
-        /*Recovery state machine*/
         for (auto& node : nodes) {
             if (node.is_recovering) {
                 node.recovery_timer++;
@@ -582,6 +609,7 @@ int main(int argc, char* argv[]) {
                         sendSDO(node.id, 0x2B, 0x6040, 0x00, 0x000F); 
                         node.recovery_step++;
                     } else {
+
                         node.fault_active = false;
                         node.heartbeat_timeout = false;
                         node.is_recovering = false;
@@ -589,8 +617,10 @@ int main(int argc, char* argv[]) {
                         addLog("INFO", node.id, 0, "SYS", nullptr, 0, "Node Recovered");
                     }
                 }
+                /* Send 0 velocity while recovering*/
                 sendRPDO_Velocity(node.id, 0);
             } else {
+                /* Normal Operation*/
                 sendRPDO_Velocity(node.id, node.current_target_velocity);
             }
         }
@@ -622,7 +652,7 @@ int main(int argc, char* argv[]) {
         loop_counter++;
     }
 
-    std::cout << "\n[EXIT] Shutting down...\n";
+    std::cout << "\n Disabling motors \n";
     clearFilter();
     
     for (auto& node : nodes) {
@@ -644,3 +674,5 @@ int main(int argc, char* argv[]) {
     
     return 0;
 }
+
+
